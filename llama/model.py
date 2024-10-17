@@ -18,19 +18,19 @@ from torch import nn
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 32
-    n_heads: int = 32
-    n_kv_heads: Optional[int] = None
-    vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
+    # 模型参数类，使用dataclass自动生成初始化函数
+    dim: int = 4096  # 模型的维度（embedding层输出维度） 即hidden_dim
+    n_layers: int = 32  # Transformer层数
+    n_heads: int = 32  # 自注意力机制的头数 
+    n_kv_heads: Optional[int] = None  # 用于Key和Value的头数
+    vocab_size: int = -1  # 词汇表大小，将由分词器定义
+    multiple_of: int = 256  # SwiGLU隐藏层大小的倍数
+    ffn_dim_multiplier: Optional[float] = None  # FFN层的维度乘数
+    norm_eps: float = 1e-5  # 归一化层的epsilon值
+    max_batch_size: int = 32  # 最大批处理大小
+    max_seq_len: int = 2048  # 最大序列长度
 
-    max_batch_size: int = 32
-    max_seq_len: int = 2048
-
-
+# RMSNorm 归一化层
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         """
@@ -47,7 +47,7 @@ class RMSNorm(torch.nn.Module):
         """
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim)) # 可学习权重
 
     def _norm(self, x):
         """
@@ -76,7 +76,7 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
+# 预计算频率张量，用于旋转嵌入
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -103,7 +103,6 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     """
     Reshape frequency tensor for broadcasting it with another tensor.
@@ -128,7 +127,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
-
+# 对输入的 Q和K 应用RoPE (Rotary Embeddings)
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -172,7 +171,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-
+# 多头注意力机制的实现
 class Attention(nn.Module):
     """Multi-head attention module."""
     def __init__(self, args: ModelArgs):
@@ -197,42 +196,43 @@ class Attention(nn.Module):
 
         """
         super().__init__()
-        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads # 如果没设置n_kv_heads，则默认为n_heads
         model_parallel_size = fs_init.get_model_parallel_world_size()
         self.n_local_heads = args.n_heads // model_parallel_size
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = args.dim // args.n_heads
-
+        self.head_dim = args.dim // args.n_heads   # 每个head_dim是hidden_dim除n_heads
+        
+        # wq的输出维度：[batch_size, seq_len, n_heads * head_dim]
         self.wq = ColumnParallelLinear(
             args.dim,
-            args.n_heads * self.head_dim,
+            args.n_heads * self.head_dim, # Q矩阵输出维度：n_heads * head_dim（Q矩阵头数（和Attention头数相同）*head_dim）
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.wk = ColumnParallelLinear(
             args.dim,
-            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim, # K矩阵输出维度：n_kv_heads * head_dim（kv矩阵头数（不一定和Attention头数相同，可能采用了GQA）*head_dim）
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.wv = ColumnParallelLinear(
             args.dim,
-            self.n_kv_heads * self.head_dim,
+            self.n_kv_heads * self.head_dim, # K V相同
             bias=False,
             gather_output=False,
             init_method=lambda x: x,
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
-            args.dim,
+            args.dim,           # 输出维度是hidden_dim,恢复形状
             bias=False,
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-
+        # 初始化一个全为零的张量，用于缓存键值
         self.cache_k = torch.zeros(
             (
                 args.max_batch_size,
@@ -270,9 +270,9 @@ class Attention(nn.Module):
             torch.Tensor: Output tensor after attention.
 
         """
-        bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
+        bsz, seqlen, _ = x.shape # [batch_size, seq_len, hidden_dim]
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x) # 经过三个线性层输出QKV矩阵（不考虑kv cache）
+        # reshape xq, xk, xv to (bs, seqlen, n_local_heads, head_dim)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -303,7 +303,7 @@ class Attention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
-
+# FFN的实现，
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -386,9 +386,9 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+        start_pos: int,  # 用于注意力缓存的起始位置
+        freqs_cis: torch.Tensor,   # 预计算的频率张量，用于旋转嵌入
+        mask: Optional[torch.Tensor], # 可选的掩码张量
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -403,7 +403,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(
+        h = x + self.attention(  # 首先对输入进行归一化，然后经过注意力机制，再与输入相加（残差连接）
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
         out = h + self.feed_forward(self.ffn_norm(h))
@@ -434,19 +434,22 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # embedding层
         self.tok_embeddings = ParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
         )
-
+        # 多个transformer blocks层
         self.layers = torch.nn.ModuleList()
+        # 多个transformer blocks组成Transformer模块，又
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
-
+        # 归一化层
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # Linear层
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
-
+        # 预计算的频率张量
         self.freqs_cis = precompute_freqs_cis(
             # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
@@ -467,12 +470,13 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        h = self.tok_embeddings(tokens) # h是经过embedding层输出的input tensor
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
+            # 填充mask
             mask = torch.full(
                 (seqlen, seqlen), float("-inf"), device=tokens.device
             )
